@@ -3,14 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D Print Cost Calculator</title>
+    <title>PrintQuote - 3D Cost Calculator</title>
     
     <!-- React & ReactDOM -->
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-    
-    <!-- Babel for JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -19,300 +20,541 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
     <style>
-        body {
-            background-color: #111827; /* Gray 900 */
-            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            color: #f3f4f6;
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: #f1f5f9; 
+            color: #0f172a;
+            -webkit-font-smoothing: antialiased;
         }
         
-        /* Input Styling */
-        .custom-input {
-            background: #1f2937; /* Gray 800 */
-            border: 1px solid #374151; /* Gray 700 */
-            color: white;
-            transition: all 0.2s;
+        /* Smooth Transitions */
+        .transition-all { transition-property: all; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); transition-duration: 200ms; }
+
+        /* Range Slider Styling */
+        input[type=range] { -webkit-appearance: none; background: transparent; }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none; height: 18px; width: 18px; border-radius: 50%;
+            background: #4f46e5; margin-top: -7px; cursor: pointer; box-shadow: 0 2px 6px rgba(79, 70, 229, 0.4);
         }
-        .custom-input:focus {
-            border-color: #3b82f6;
-            ring: 2px;
-            outline: none;
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%; height: 4px; background: #cbd5e1; border-radius: 2px;
         }
 
-        /* Remove spinners from number inputs */
-        input[type=number]::-webkit-inner-spin-button, 
-        input[type=number]::-webkit-outer-spin-button { 
-            -webkit-appearance: none; 
-            margin: 0; 
-        }
+        /* --- PRINT MODE STYLING --- */
+        @media print {
+            /* Hide everything generally */
+            body * {
+                visibility: hidden;
+            }
+            
+            /* Make background white */
+            body {
+                background-color: white;
+                margin: 0;
+                padding: 0;
+            }
 
-        .card-shadow {
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
+            /* Target the specific invoice card to show */
+            #quote-invoice, #quote-invoice * {
+                visibility: visible;
+            }
+
+            /* Position the invoice at top-left of page */
+            #quote-invoice {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                margin: 0;
+                padding: 20px;
+                box-shadow: none !important;
+                border: 1px solid #ddd !important;
+                border-radius: 0 !important;
+            }
+
+            /* Hide interactive elements inside the invoice during print */
+            .no-print, button, input[type=range], select {
+                display: none !important;
+            }
+            
+            /* Ensure text inputs look like flat text */
+            input {
+                border: none !important;
+                background: transparent !important;
+                padding: 0 !important;
+            }
+            
+            /* Hide the chart canvas to save ink/clean look (optional, can remove if you want graph) */
+            canvas { display: none !important; }
+            .chart-container { display: none !important; }
         }
     </style>
 </head>
 <body>
 
-    <div id="root"></div>
+<div id="root"></div>
 
-    <script type="text/babel">
-        const { useState } = React;
+<script type="text/babel">
+    const { useState, useEffect, useRef } = React;
 
-        // --- REUSABLE COMPONENTS ---
-        
-        const InputGroup = ({ label, icon, children, subtext }) => (
-            <div className="mb-5">
-                <label className="block text-gray-400 text-xs font-bold uppercase tracking-wider mb-2 flex items-center gap-2">
-                    <i className={`fas ${icon} w-4 text-center text-blue-500`}></i> {label}
-                </label>
-                {children}
-                {subtext && <p className="text-xs text-gray-500 mt-1 ml-1">{subtext}</p>}
-            </div>
-        );
+    // --- CONSTANTS ---
+    const CURRENCIES = { USD: "$", EUR: "€", GBP: "£" };
 
-        const NumberInput = ({ value, onChange, suffix, prefix, step = 1, min = 0 }) => (
-            <div className="flex relative rounded-md shadow-sm">
-                {prefix && <span className="inline-flex items-center px-3 rounded-l-md border border-r-0 border-gray-600 bg-gray-700 text-gray-300 text-sm">{prefix}</span>}
+    // --- STL PARSER & ESTIMATOR ---
+    const parseSTL = (buffer) => {
+        try {
+            const view = new DataView(buffer);
+            const numTriangles = view.getUint32(80, true);
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+            let totalVolume = 0;
+            
+            let offset = 84;
+            for (let i = 0; i < numTriangles; i++) {
+                // Vertices for Bounding Box
+                const x1 = view.getFloat32(offset + 12, true); const y1 = view.getFloat32(offset + 16, true); const z1 = view.getFloat32(offset + 20, true);
+                const x2 = view.getFloat32(offset + 24, true); const y2 = view.getFloat32(offset + 28, true); const z2 = view.getFloat32(offset + 32, true);
+                const x3 = view.getFloat32(offset + 36, true); const y3 = view.getFloat32(offset + 40, true); const z3 = view.getFloat32(offset + 44, true);
+
+                minX = Math.min(minX, x1, x2, x3); maxX = Math.max(maxX, x1, x2, x3);
+                minY = Math.min(minY, y1, y2, y3); maxY = Math.max(maxY, y1, y2, y3);
+                minZ = Math.min(minZ, z1, z2, z3); maxZ = Math.max(maxZ, z1, z2, z3);
+
+                // Volume (Signed Tetrahedron)
+                totalVolume += (-x3 * y2 * z1 + x2 * y3 * z1 + x3 * y1 * z2 - x1 * y3 * z2 - x2 * y1 * z3 + x1 * y2 * z3) / 6.0;
+                offset += 50;
+            }
+
+            return { 
+                x: (maxX - minX).toFixed(1), 
+                y: (maxY - minY).toFixed(1), 
+                z: (maxZ - minZ).toFixed(1),
+                volumeCm3: Math.abs(totalVolume) / 1000
+            };
+        } catch (e) { console.error(e); return null; }
+    };
+
+    // --- COMPONENTS ---
+
+    const InputGroup = ({ label, value, onChange, suffix, type="number", step="any", min }) => (
+        <div className="group relative">
+            <label className="input-group-label block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1 group-focus-within:text-indigo-600 transition-colors">{label}</label>
+            <div className="relative flex items-center">
                 <input 
-                    type="number" 
-                    value={value} 
-                    onChange={(e) => onChange(e.target.value === '' ? 0 : parseFloat(e.target.value))}
-                    className={`flex-1 block w-full min-w-0 custom-input py-2 px-3 sm:text-sm ${prefix ? '' : 'rounded-l-md'} ${suffix ? '' : 'rounded-r-md'}`}
+                    type={type}
                     step={step}
                     min={min}
-                    onFocus={(e) => e.target.select()}
+                    value={value} 
+                    onChange={e => onChange(e.target.value)} 
+                    className="w-full bg-white text-slate-700 border-b border-slate-200 py-1.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors font-semibold"
                 />
-                {suffix && <span className="inline-flex items-center px-3 rounded-r-md border border-l-0 border-gray-600 bg-gray-700 text-gray-300 text-sm">{suffix}</span>}
+                {suffix && <span className="absolute right-0 text-xs text-slate-400 font-medium pointer-events-none bg-white pl-1">{suffix}</span>}
             </div>
-        );
+        </div>
+    );
 
-        // --- MAIN APP ---
+    const PriceOption = ({ title, price, symbol, selected, onClick, margin }) => (
+        <div 
+            onClick={onClick}
+            className={`cursor-pointer rounded-lg p-3 border transition-all duration-200 ${selected 
+                ? 'border-indigo-600 bg-indigo-50 ring-1 ring-indigo-600' 
+                : 'border-slate-200 hover:border-indigo-300 hover:bg-white'}`}
+        >
+            <div className="flex justify-between items-center mb-1">
+                <span className={`text-xs font-bold uppercase ${selected ? 'text-indigo-700' : 'text-slate-500'}`}>{title}</span>
+                <span className="text-[10px] text-slate-400 bg-white px-1.5 py-0.5 rounded-full border border-slate-100">{margin}%</span>
+            </div>
+            <div className="text-lg font-bold text-slate-800">{symbol}{price}</div>
+        </div>
+    );
 
-        const App = () => {
-            // State
-            const [filamentCost, setFilamentCost] = useState(20.00);
-            const [spoolWeight, setSpoolWeight] = useState(1000);
-            const [printWeight, setPrintWeight] = useState(50);
-            const [printTimeHours, setPrintTimeHours] = useState(4);
-            const [printTimeMinutes, setPrintTimeMinutes] = useState(30);
-            const [watts, setWatts] = useState(150);
-            const [kwhCost, setKwhCost] = useState(0.15);
+    // --- MAIN APP ---
+    const App = () => {
+        const [curr, setCurr] = useState('USD');
+        const [showAdvanced, setShowAdvanced] = useState(true); 
+
+        // State
+        const [inputs, setInputs] = useState({
+            partName: 'Untitled Project',
+            filamentCost: 20.00,
+            spoolWeight: 1000,
+            printWeight: 257,
+            printTimeHrs: 5,
+            printTimeMin: 45,
+            speed: 100, // mm/s
             
-            const [showAdvanced, setShowAdvanced] = useState(false);
-            const [laborTime, setLaborTime] = useState(0);
-            const [laborRate, setLaborRate] = useState(15.00);
-            const [depreciationPerHr, setDepreciationPerHr] = useState(0.10);
-            const [failureRate, setFailureRate] = useState(0);
-            const [markup, setMarkup] = useState(0);
-            const [shipping, setShipping] = useState(0);
-            const [handling, setHandling] = useState(0);
+            watts: 155,
+            kwhRate: 0.15,
+            
+            laborTime: 2,
+            laborRate: 15,
+            depreciation: 0.1,
+            failureRate: 0,
+            
+            shipping: 0,
+            handling: 5,
+            customMargin: 14
+        });
 
-            const currency = "$";
+        const [dims, setDims] = useState(null);
+        const chartRef = useRef(null);
+        const chartInstanceRef = useRef(null);
 
-            // Calculations
-            const calculate = () => {
-                const materialCost = (filamentCost / spoolWeight) * printWeight;
-                
-                const totalHours = parseFloat(printTimeHours) + (parseFloat(printTimeMinutes) / 60);
-                const energyCost = (watts / 1000) * totalHours * kwhCost;
-                
-                const laborCost = (laborTime / 60) * laborRate;
-                const depreciationCost = totalHours * depreciationPerHr;
-                
-                const baseCost = materialCost + energyCost + laborCost + depreciationCost;
-                const failureCost = baseCost * (failureRate / 100);
-                const costWithFailure = baseCost + failureCost;
-                
-                const profit = costWithFailure * (markup / 100);
-                const extras = parseFloat(shipping) + parseFloat(handling);
-                
-                const total = costWithFailure + profit + extras;
-
-                return {
-                    material: materialCost,
-                    energy: energyCost,
-                    ops: laborCost + depreciationCost,
-                    failure: failureCost,
-                    profit: profit,
-                    extras: extras,
-                    total: total,
-                    raw: baseCost
-                };
-            };
-
-            const costs = calculate();
-
-            return (
-                <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto">
-                    
-                    {/* Header */}
-                    <div className="flex flex-col md:flex-row justify-between items-center mb-8 border-b border-gray-700 pb-6">
-                        <div className="flex items-center gap-3 mb-4 md:mb-0">
-                            <div className="bg-blue-600 p-2 rounded-lg">
-                                <i className="fas fa-cube text-white text-xl"></i>
-                            </div>
-                            <div>
-                                <h1 className="text-2xl font-bold text-white">3D Print Calculator</h1>
-                                <p className="text-gray-400 text-sm">Standard Utility</p>
-                            </div>
-                        </div>
-                        <button 
-                            onClick={() => setShowAdvanced(!showAdvanced)}
-                            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors border ${showAdvanced ? 'bg-blue-600 border-blue-600 text-white' : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'}`}
-                        >
-                            <i className={`fas ${showAdvanced ? 'fa-check-square' : 'fa-square'} mr-2`}></i>
-                            Advanced Mode
-                        </button>
-                    </div>
-
-                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                        
-                        {/* LEFT COLUMN: Inputs */}
-                        <div className="lg:col-span-7 space-y-6">
-                            
-                            {/* Material Section */}
-                            <div className="bg-gray-800 p-6 rounded-xl card-shadow border border-gray-700">
-                                <h2 className="text-lg font-semibold text-white mb-4 pb-2 border-b border-gray-700">1. Material & Time</h2>
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                    <div className="space-y-4">
-                                        <InputGroup label="Spool Cost" icon="fa-tag">
-                                            <NumberInput value={filamentCost} onChange={setFilamentCost} prefix={currency} step="0.01" />
-                                        </InputGroup>
-                                        <InputGroup label="Spool Weight" icon="fa-weight-hanging">
-                                            <NumberInput value={spoolWeight} onChange={setSpoolWeight} suffix="g" step="100" />
-                                        </InputGroup>
-                                    </div>
-                                    <div className="space-y-4">
-                                        <InputGroup label="Print Weight" icon="fa-layer-group">
-                                            <NumberInput value={printWeight} onChange={setPrintWeight} suffix="g" />
-                                        </InputGroup>
-                                        <div className="grid grid-cols-2 gap-3">
-                                            <InputGroup label="Hours" icon="fa-clock">
-                                                <NumberInput value={printTimeHours} onChange={setPrintTimeHours} suffix="h" />
-                                            </InputGroup>
-                                            <InputGroup label="Minutes" icon="fa-stopwatch">
-                                                <NumberInput value={printTimeMinutes} onChange={setPrintTimeMinutes} suffix="m" />
-                                            </InputGroup>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            {/* Energy Section */}
-                            <div className="bg-gray-800 p-6 rounded-xl card-shadow border border-gray-700">
-                                <h2 className="text-lg font-semibold text-white mb-4 pb-2 border-b border-gray-700">2. Electricity</h2>
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                    <InputGroup label="Printer Wattage" icon="fa-bolt" subtext="Avg: 150W">
-                                        <NumberInput value={watts} onChange={setWatts} suffix="W" step="10" />
-                                    </InputGroup>
-                                    <InputGroup label="Electricity Rate" icon="fa-plug" subtext="Cost per kWh">
-                                        <NumberInput value={kwhCost} onChange={setKwhCost} prefix={currency} suffix="/kWh" step="0.01" />
-                                    </InputGroup>
-                                </div>
-                            </div>
-
-                            {/* Advanced Section */}
-                            {showAdvanced && (
-                                <div className="bg-gray-800 p-6 rounded-xl card-shadow border border-gray-700 animate-fade-in">
-                                    <h2 className="text-lg font-semibold text-white mb-4 pb-2 border-b border-gray-700">3. Business & Extras</h2>
-                                    
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                                        <InputGroup label="Labor Time" icon="fa-user-clock">
-                                            <NumberInput value={laborTime} onChange={setLaborTime} suffix="min" />
-                                        </InputGroup>
-                                        <InputGroup label="Labor Rate" icon="fa-user-tag">
-                                            <NumberInput value={laborRate} onChange={setLaborRate} prefix={currency} suffix="/hr" />
-                                        </InputGroup>
-                                        <InputGroup label="Machine Wear" icon="fa-wrench">
-                                            <NumberInput value={depreciationPerHr} onChange={setDepreciationPerHr} prefix={currency} suffix="/hr" step="0.05" />
-                                        </InputGroup>
-                                        <InputGroup label="Failure Rate" icon="fa-exclamation-triangle">
-                                            <NumberInput value={failureRate} onChange={setFailureRate} suffix="%" />
-                                        </InputGroup>
-                                    </div>
-
-                                    <div className="border-t border-gray-700 pt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-                                        <InputGroup label="Shipping" icon="fa-truck">
-                                            <NumberInput value={shipping} onChange={setShipping} prefix={currency} step="0.50" />
-                                        </InputGroup>
-                                        <InputGroup label="Handling/Fees" icon="fa-box-open">
-                                            <NumberInput value={handling} onChange={setHandling} prefix={currency} step="0.50" />
-                                        </InputGroup>
-                                        <div className="bg-gray-700/50 p-3 rounded-lg">
-                                            <label className="block text-gray-400 text-xs font-bold uppercase mb-2">Profit Markup: {markup}%</label>
-                                            <input type="range" min="0" max="200" value={markup} onChange={e => setMarkup(parseInt(e.target.value))} className="w-full h-2 bg-gray-600 rounded-lg appearance-none cursor-pointer" />
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-
-                        </div>
-
-                        {/* RIGHT COLUMN: Results */}
-                        <div className="lg:col-span-5 space-y-6">
-                            
-                            {/* Main Price Card */}
-                            <div className="bg-gray-800 p-8 rounded-xl card-shadow border border-gray-700 text-center relative overflow-hidden">
-                                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-purple-600"></div>
-                                <h3 className="text-gray-400 text-sm font-bold uppercase tracking-widest mb-2">Estimated Total</h3>
-                                <div className="text-5xl font-bold text-white mb-2">
-                                    {currency}{costs.total.toFixed(2)}
-                                </div>
-                                <div className="flex justify-center gap-4 text-xs text-gray-400">
-                                    <span>Raw Cost: {currency}{costs.raw.toFixed(2)}</span>
-                                    {costs.profit > 0 && <span className="text-green-400">Profit: +{currency}{costs.profit.toFixed(2)}</span>}
-                                </div>
-                            </div>
-
-                            {/* Breakdown */}
-                            <div className="bg-gray-800 p-6 rounded-xl card-shadow border border-gray-700">
-                                <h3 className="text-white font-bold mb-4">Cost Breakdown</h3>
-                                <div className="space-y-4">
-                                    {[
-                                        { label: "Material", val: costs.material, color: "bg-blue-500", icon: "fa-cube" },
-                                        { label: "Electricity", val: costs.energy, color: "bg-yellow-500", icon: "fa-bolt" },
-                                        { label: "Ops & Labor", val: costs.ops, color: "bg-purple-500", icon: "fa-tools", hide: !showAdvanced },
-                                        { label: "Extras", val: costs.extras, color: "bg-green-500", icon: "fa-truck", hide: !showAdvanced },
-                                        { label: "Profit", val: costs.profit, color: "bg-emerald-500", icon: "fa-coins", hide: !showAdvanced }
-                                    ].map((item, i) => {
-                                        if (item.hide && item.val === 0) return null;
-                                        const pct = Math.min((item.val / costs.total) * 100, 100) || 0;
-                                        return (
-                                            <div key={i}>
-                                                <div className="flex justify-between text-sm mb-1 text-gray-300">
-                                                    <span className="flex items-center gap-2"><i className={`fas ${item.icon} w-4 text-center opacity-50`}></i> {item.label}</span>
-                                                    <span>{currency}{item.val.toFixed(2)}</span>
-                                                </div>
-                                                <div className="w-full bg-gray-700 rounded-full h-2">
-                                                    <div className={`${item.color} h-2 rounded-full`} style={{ width: `${pct}%` }}></div>
-                                                </div>
-                                            </div>
-                                        )
-                                    })}
-                                </div>
-                            </div>
-
-                            {/* Actions */}
-                            <div className="grid grid-cols-2 gap-4">
-                                <button onClick={() => window.print()} className="bg-gray-700 hover:bg-gray-600 text-white py-3 rounded-lg font-medium transition-colors flex items-center justify-center gap-2">
-                                    <i className="fas fa-print"></i> Print
-                                </button>
-                                <button onClick={() => {
-                                    const text = `Quote: ${currency}${costs.total.toFixed(2)}\nMaterial: ${currency}${costs.material.toFixed(2)}\nEnergy: ${currency}${costs.energy.toFixed(2)}`;
-                                    navigator.clipboard.writeText(text);
-                                    alert('Copied to clipboard');
-                                }} className="bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium transition-colors flex items-center justify-center gap-2">
-                                    <i className="fas fa-copy"></i> Copy
-                                </button>
-                            </div>
-
-                        </div>
-                    </div>
-                </div>
-            );
+        // Calculations
+        const calculate = () => {
+            const mat = (inputs.filamentCost / inputs.spoolWeight) * inputs.printWeight;
+            const hrs = parseFloat(inputs.printTimeHrs) + (parseFloat(inputs.printTimeMin) / 60);
+            const pwr = (inputs.watts / 1000) * hrs * inputs.kwhRate;
+            const lab = (inputs.laborTime / 60) * inputs.laborRate;
+            const dep = hrs * inputs.depreciation;
+            
+            const productionBase = mat + pwr + lab + dep;
+            const failCost = productionBase * (inputs.failureRate / 100);
+            const mfgCost = productionBase + failCost;
+            const profit = mfgCost * (inputs.customMargin / 100);
+            const extras = parseFloat(inputs.shipping) + parseFloat(inputs.handling);
+            const final = mfgCost + profit + extras;
+            
+            return { mat, lab, pwr, dep, failCost, extras, mfgCost, final, profit };
         };
 
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<App />);
-    </script>
+        const data = calculate();
+        const sym = CURRENCIES[curr];
+
+        // Chart Effect
+        useEffect(() => {
+            if (!chartRef.current) return;
+            const ctx = chartRef.current.getContext('2d');
+            if (chartInstanceRef.current) chartInstanceRef.current.destroy();
+
+            chartInstanceRef.current = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Material', 'Labor', 'Energy', 'Machine', 'Failure', 'Extras'],
+                    datasets: [{
+                        data: [data.mat, data.lab, data.pwr, data.dep, data.failCost, data.extras],
+                        backgroundColor: ['#4f46e5', '#06b6d4', '#f59e0b', '#8b5cf6', '#ef4444', '#64748b'],
+                        borderWidth: 0,
+                        hoverOffset: 6
+                    }]
+                },
+                options: {
+                    cutout: '75%',
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } }
+                }
+            });
+            return () => { if (chartInstanceRef.current) chartInstanceRef.current.destroy(); };
+        }, [inputs]);
+
+        // File Handler & Estimation
+        const handleFile = (e) => {
+            const f = e.target.files[0];
+            if(!f) return;
+            const r = new FileReader();
+            r.onload = (ev) => {
+                const d = parseSTL(ev.target.result);
+                if(d) {
+                    setDims(d);
+                    
+                    // 1. Estimate Weight (PLA Density 1.24 g/cm3 * ~35% Infill/Walls/Tops)
+                    const estWeight = (d.volumeCm3 * 1.24 * 0.35).toFixed(0);
+                    
+                    // 2. Estimate Time via Volumetric Flow Rate
+                    // Assumptions: 0.4mm line width, 0.2mm layer height
+                    // Flow (mm3/s) = Speed (mm/s) * 0.4 * 0.2
+                    const nozzle = 0.4;
+                    const layer = 0.2;
+                    const volumetricFlow = inputs.speed * nozzle * layer; // mm3/s
+                    
+                    // Total Volume to print (Solids + Infill)
+                    // We estimated weight based on 35% solidity, so let's use that volume
+                    const printVolumeMm3 = (d.volumeCm3 * 1000) * 0.35;
+                    
+                    // Seconds = Volume / Flow
+                    // Efficiency factor (0.8) accounts for acceleration, travel moves, heating
+                    const efficiency = 0.8; 
+                    const totalSeconds = printVolumeMm3 / (volumetricFlow * efficiency);
+                    
+                    const totalHours = totalSeconds / 3600;
+                    
+                    const estHrs = Math.floor(totalHours);
+                    const estMins = Math.round((totalHours - estHrs) * 60);
+
+                    setInputs(prev => ({
+                        ...prev, 
+                        partName: f.name.replace('.stl',''),
+                        printWeight: estWeight,
+                        printTimeHrs: estHrs,
+                        printTimeMin: estMins
+                    }));
+                }
+            };
+            r.readAsArrayBuffer(f);
+        };
+
+        // JSON Handling
+        const exportJSON = () => {
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(inputs));
+            const node = document.createElement('a');
+            node.setAttribute("href", dataStr);
+            node.setAttribute("download", "print_settings.json");
+            document.body.appendChild(node);
+            node.click();
+            node.remove();
+        };
+        const importJSON = (e) => {
+            const f = e.target.files[0]; if(!f) return;
+            const r = new FileReader();
+            r.onload = (ev) => setInputs(JSON.parse(ev.target.result));
+            r.readAsText(f);
+        };
+
+        return (
+            <div className="min-h-screen py-10 px-4 md:px-8 max-w-6xl mx-auto">
+                
+                {/* Header */}
+                <nav className="flex justify-between items-center mb-10 no-print">
+                    <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-indigo-200">
+                            <i className="fas fa-cube text-lg"></i>
+                        </div>
+                        <div>
+                            <h1 className="font-bold text-xl tracking-tight text-slate-800">PrintQuote</h1>
+                            <p className="text-xs text-slate-400 font-medium">Professional Estimator</p>
+                        </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                         <label className="cursor-pointer text-xs font-bold text-slate-500 hover:text-indigo-600 transition-colors flex items-center gap-1">
+                            <i className="fas fa-file-import"></i> Load
+                            <input type="file" accept=".json" className="hidden" onChange={importJSON} />
+                        </label>
+                         <button onClick={exportJSON} className="text-xs font-bold text-slate-500 hover:text-indigo-600 transition-colors flex items-center gap-1">
+                            <i className="fas fa-file-export"></i> Save
+                        </button>
+                        <select value={curr} onChange={e => setCurr(e.target.value)} className="text-sm font-bold text-slate-600 bg-transparent border-none focus:ring-0 cursor-pointer">
+                            <option value="USD">USD ($)</option>
+                            <option value="EUR">EUR (€)</option>
+                            <option value="GBP">GBP (£)</option>
+                        </select>
+                        <button onClick={() => window.print()} className="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-md hover:bg-indigo-700 transition-all flex items-center gap-2">
+                            <i className="fas fa-print"></i> Print Quote
+                        </button>
+                    </div>
+                </nav>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+                    {/* LEFT: Configuration */}
+                    <div className="lg:col-span-2 space-y-6 config-column no-print">
+                        
+                        {/* Project Info Section */}
+                        <section className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100">
+                            <div className="flex justify-between items-start mb-6">
+                                <h2 className="font-bold text-slate-800 flex items-center gap-2">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span> 1. Material & Specs
+                                </h2>
+                                <label className="cursor-pointer text-xs font-bold text-indigo-600 bg-indigo-50 px-3 py-1.5 rounded-full hover:bg-indigo-100 transition-colors no-print border border-indigo-100">
+                                    <i className="fas fa-upload mr-1"></i> Analyze STL
+                                    <input type="file" accept=".stl" className="hidden" onChange={handleFile} />
+                                </label>
+                            </div>
+                            
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
+                                <div className="md:col-span-2">
+                                    <InputGroup label="Project Name" type="text" value={inputs.partName} onChange={v => setInputs({...inputs, partName: v})} />
+                                    {dims && (
+                                        <div className="mt-3 bg-slate-50 p-3 rounded-lg border border-slate-100 flex flex-wrap gap-4">
+                                            <div>
+                                                <div className="text-[10px] font-bold text-slate-400 uppercase">Dimensions</div>
+                                                <div className="text-xs font-bold text-slate-700">{dims.x} × {dims.y} × {dims.z} mm</div>
+                                            </div>
+                                            <div>
+                                                <div className="text-[10px] font-bold text-slate-400 uppercase">Suggested Box</div>
+                                                <div className="text-xs font-bold text-indigo-600">
+                                                    {(parseFloat(dims.x)+10).toFixed(0)} × {(parseFloat(dims.y)+10).toFixed(0)} × {(parseFloat(dims.z)+10).toFixed(0)} mm
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <InputGroup label="Filament Cost" suffix={sym} value={inputs.filamentCost} onChange={v => setInputs({...inputs, filamentCost: v})} />
+                                <InputGroup label="Spool Weight" suffix="g" value={inputs.spoolWeight} onChange={v => setInputs({...inputs, spoolWeight: v})} />
+                                
+                                <InputGroup label="Estimated Weight" suffix="g" value={inputs.printWeight} onChange={v => setInputs({...inputs, printWeight: v})} />
+                                
+                                <div className="relative">
+                                    <InputGroup label="Print Speed" suffix="mm/s" value={inputs.speed} onChange={v => setInputs({...inputs, speed: v})} />
+                                    <div className="text-[9px] text-slate-400 mt-1 absolute -bottom-4 left-0 w-full">
+                                        *Time est. based on 0.4mm nozzle / 0.2mm layer
+                                    </div>
+                                </div>
+                                
+                                <div className="grid grid-cols-2 gap-4 md:col-span-2">
+                                    <InputGroup label="Est. Hours" suffix="h" value={inputs.printTimeHrs} onChange={v => setInputs({...inputs, printTimeHrs: v})} />
+                                    <InputGroup label="Minutes" suffix="m" value={inputs.printTimeMin} onChange={v => setInputs({...inputs, printTimeMin: v})} />
+                                </div>
+                            </div>
+                        </section>
+
+                        {/* Electricity Section */}
+                        <section className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100">
+                             <h2 className="font-bold text-slate-800 flex items-center gap-2 mb-6">
+                                <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span> 2. Power Consumption
+                            </h2>
+                             <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
+                                <InputGroup label="Printer Wattage" suffix="W" value={inputs.watts} onChange={v => setInputs({...inputs, watts: v})} />
+                                <InputGroup label="Electricity Rate" suffix="/kWh" value={inputs.kwhRate} onChange={v => setInputs({...inputs, kwhRate: v})} />
+                             </div>
+                        </section>
+
+                        {/* Advanced / Overhead Section */}
+                        <section className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100">
+                            <div className="flex justify-between items-center mb-6 cursor-pointer no-print" onClick={() => setShowAdvanced(!showAdvanced)}>
+                                <h2 className="font-bold text-slate-800 flex items-center gap-2">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-500"></span> 3. Business & Extras
+                                </h2>
+                                <i className={`fas fa-chevron-down text-slate-300 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}></i>
+                            </div>
+                            
+                            <div className={`grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6 ${showAdvanced ? 'block' : 'hidden md:grid'}`}>
+                                <InputGroup label="Labor Time" suffix="min" value={inputs.laborTime} onChange={v => setInputs({...inputs, laborTime: v})} />
+                                <InputGroup label="Labor Rate" suffix="/hr" value={inputs.laborRate} onChange={v => setInputs({...inputs, laborRate: v})} />
+                                
+                                <InputGroup label="Machine Wear" suffix="/hr" value={inputs.depreciation} onChange={v => setInputs({...inputs, depreciation: v})} />
+                                <InputGroup label="Failure Rate" suffix="%" value={inputs.failureRate} onChange={v => setInputs({...inputs, failureRate: v})} />
+
+                                <InputGroup label="Shipping Cost" suffix={sym} value={inputs.shipping} onChange={v => setInputs({...inputs, shipping: v})} />
+                                <InputGroup label="Handling Fee" suffix={sym} value={inputs.handling} onChange={v => setInputs({...inputs, handling: v})} />
+                            </div>
+                        </section>
+                    </div>
+
+                    {/* RIGHT: Results / Invoice (THE ONLY PART THAT PRINTS) */}
+                    <div className="lg:col-span-1 result-column" id="quote-invoice">
+                        <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/60 overflow-hidden border border-slate-100 print-container sticky top-6">
+                            
+                            {/* Total Banner */}
+                            <div className="bg-slate-900 p-8 text-center relative overflow-hidden">
+                                <div className="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500"></div>
+                                
+                                {/* Print-Only Header */}
+                                <div className="hidden print-only mb-4">
+                                    <h1 className="text-3xl font-bold text-slate-900">Print Quotation</h1>
+                                    <p className="text-sm text-slate-500">Project: {inputs.partName}</p>
+                                    <div className="border-b border-slate-200 my-4"></div>
+                                </div>
+
+                                <h3 className="text-slate-400 text-[10px] font-bold uppercase tracking-widest mb-2 no-print">Estimated Quote</h3>
+                                <div className="text-5xl font-bold text-white tracking-tight print:text-black print:text-6xl">{sym}{data.final.toFixed(2)}</div>
+                                <div className="text-xs font-medium text-emerald-400 mt-3 bg-emerald-400/10 inline-block px-3 py-1 rounded-full no-print">
+                                    Profit: +{sym}{data.profit.toFixed(2)}
+                                </div>
+                            </div>
+
+                            {/* Visualization (Hidden in Print) */}
+                            <div className="p-6 border-b border-slate-100 relative chart-container">
+                                <div className="h-40 w-40 mx-auto">
+                                    <canvas ref={chartRef}></canvas>
+                                </div>
+                                <div className="absolute inset-0 flex items-center justify-center pointer-events-none mt-2">
+                                    <div className="text-center">
+                                        <div className="text-[10px] text-slate-400 uppercase font-bold">Base</div>
+                                        <div className="text-sm font-bold text-slate-700">{sym}{data.mfgCost.toFixed(2)}</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Bill Breakdown */}
+                            <div className="p-6 space-y-3">
+                                <div className="flex justify-between text-sm items-center">
+                                    <span className="text-slate-500 flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-indigo-600 no-print"></span> Material Cost</span>
+                                    <span className="font-medium text-slate-700">{sym}{data.mat.toFixed(2)}</span>
+                                </div>
+                                <div className="flex justify-between text-sm items-center">
+                                    <span className="text-slate-500 flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-amber-500 no-print"></span> Electricity</span>
+                                    <span className="font-medium text-slate-700">{sym}{data.pwr.toFixed(2)}</span>
+                                </div>
+                                <div className="flex justify-between text-sm items-center">
+                                    <span className="text-slate-500 flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-cyan-500 no-print"></span> Labor</span>
+                                    <span className="font-medium text-slate-700">{sym}{data.lab.toFixed(2)}</span>
+                                </div>
+                                <div className="flex justify-between text-sm items-center">
+                                    <span className="text-slate-500 flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-violet-500 no-print"></span> Machine Wear</span>
+                                    <span className="font-medium text-slate-700">{sym}{data.dep.toFixed(2)}</span>
+                                </div>
+                                {data.failCost > 0 && (
+                                <div className="flex justify-between text-sm items-center">
+                                    <span className="text-slate-500 flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-red-500 no-print"></span> Failure Buffer</span>
+                                    <span className="font-medium text-slate-700">{sym}{data.failCost.toFixed(2)}</span>
+                                </div>
+                                )}
+                                <div className="flex justify-between text-sm items-center pt-2 border-t border-slate-50">
+                                    <span className="text-slate-500 flex items-center gap-2">Shipping & Handling</span>
+                                    <span className="font-medium text-slate-700">{sym}{data.extras.toFixed(2)}</span>
+                                </div>
+                                
+                                <div className="my-4 border-t border-slate-100"></div>
+                                
+                                <div className="space-y-2 no-print">
+                                    <div className="flex justify-between items-center">
+                                        <span className="text-xs font-bold text-slate-400 uppercase">Markup ({inputs.customMargin}%)</span>
+                                        <input 
+                                            type="range" min="0" max="300" value={inputs.customMargin} 
+                                            onChange={e => setInputs({...inputs, customMargin: parseInt(e.target.value)})}
+                                            className="w-24 h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2 mt-4">
+                                        <PriceOption 
+                                            title="Fair" margin={50} symbol={sym}
+                                            price={(data.mfgCost * 1.5 + data.extras).toFixed(2)} 
+                                            onClick={() => setInputs({...inputs, customMargin: 50})}
+                                            selected={inputs.customMargin === 50}
+                                        />
+                                        <PriceOption 
+                                            title="Retail" margin={100} symbol={sym}
+                                            price={(data.mfgCost * 2.0 + data.extras).toFixed(2)} 
+                                            onClick={() => setInputs({...inputs, customMargin: 100})}
+                                            selected={inputs.customMargin === 100}
+                                        />
+                                    </div>
+                                </div>
+                                
+                                <div className="hidden print-only mt-8 pt-4 border-t border-slate-300 text-center text-xs text-slate-400">
+                                    Generated by PrintQuote • Valid for 30 days
+                                </div>
+                            </div>
+
+                            {/* Footer Actions */}
+                            <div className="bg-slate-50 p-4 border-t border-slate-100 text-center no-print">
+                                <button 
+                                    onClick={() => {
+                                        const json = JSON.stringify(inputs);
+                                        const url = window.location.href.split('#')[0] + '#' + btoa(json);
+                                        navigator.clipboard.writeText(url);
+                                        alert("Settings URL copied to clipboard!");
+                                    }}
+                                    className="text-indigo-600 text-xs font-bold uppercase tracking-wide hover:underline"
+                                >
+                                    <i className="fas fa-link mr-1"></i> Copy Share Link
+                                </button>
+                            </div>
+
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+</script>
 </body>
 </html>
+
